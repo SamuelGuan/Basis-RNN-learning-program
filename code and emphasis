@@ -1,0 +1,214 @@
+'''=====ATTENTION======'''
+#this blog need reader to have the basis knowledge of RNN's structure, RNN's calculation process
+#this blog aimed at coding
+
+  
+'''=====BLOG'S MAIN BODY======'''
+#first of all, if we wanted to start this program, we should download some model to support our code.
+#as following,we need these
+#-------------------------
+import pandas as pd
+import torch
+from torch import nn
+from torch.utils.data import TensorDataset
+from torch.utils.data import DataLoader
+import matplotlib.pyplot as plt
+
+
+'''======SECOND PART================================================================================'''
+#secondly,we know that if we wanted to run a nerous network, we must initiate it as a python class originating from a father class [torch.nn.Module]
+'''there are several parameters.
+  num_feature is the number of features of input vectors, sometimes we call it input_dim or input_size
+  hidden_size is the number of RNN cell at one hidden layer
+  output_dim is the length of output vectors
+  num_layers is the number of hidden layers, pay attention to it, or you may get the disappear grad problem
+  dropout is the rate of untrain cell occuppying total cell at one hidden layer, it must be a float
+  non_linearity is the activate function, only two options tanh and relu'''
+#-------------------------
+class RNN(nn.Module):
+    def __init__(self,num_features:int, hidden_size:int,output_dim:int,
+                 num_layers, dropout:float, non_linearity:str):
+        super(RNN, self).__init__()
+        self.hidden_size = hidden_size
+        self.rnn = nn.RNN(
+            input_size=num_features,  # 输入特征维度,当前特征为股价，维度为1
+            hidden_size=hidden_size,  # 隐藏层神经元个数，或者也叫输出的维度
+            num_layers=num_layers,
+            batch_first=True,
+            dropout = dropout,
+            nonlinearity = non_linearity
+        )
+        self.linear = nn.Linear(hidden_size, output_dim)
+#-------------------------
+#we also need to definite the forward function 
+'''ht is the hidden state of each RNN layers, the out is the output'''
+'''as we know our calculation start from matrix plus, then go through the activate function tanh, finally get output and ht'''
+'''then the output get through the full connect network to the next step'''
+'''we must keep the matrix x shape as [batch_order,batch_size,num_feature]'''
+'''we must keep the matrix hidden_prev shape as [num_layers, batch_size, hidden_size]'''
+'''batch_size is the number of example each batch'''
+'''batch_order is the order of the batch'''
+#-------------------------
+    def forward(self, X, previous_hidden):
+        out, ht = self.rnn(X, previous_hidden)
+        out = out.view(-1, self.hidden_size)  
+        out = self.linear(out)  # out[1,1]
+        return out, ht
+
+  
+'''=====THIRD PART==========================================================================='''
+#our aim is to predict time series to analysis market price
+#thus we need a 'window' like FFT(Fast Fourier Transfrom) to process the data
+#in my code, i hope my predict is based on the previous 8 data, which means the 9th data is predicted by previous 8 data
+#so the time_step is the length of 'window'
+#attention, the type of data must be python list or numpy ndarray or pandas series!!!!
+#attention, the dim of data must be 1 dimension
+# 定义etract_data函数，能够将数据转换为时间序列
+#-------------------------
+def etract_data(data, time_step):
+    X, y = [], []
+    for i in range(len(data) - time_step):
+        X.append([a for a in data[i:i + time_step]])
+        y.append([data[i + time_step]])
+    X = torch.tensor(X).type(torch.FloatTensor)
+    X = X.reshape(-1, time_step, 1)
+    y = torch.tensor(y).type(torch.FloatTensor)
+    y = y.reshape(-1, 1)
+    return X, y
+# 数据预处理
+def process_data(type:str,train_size_rate,time_step=8,batch_size=1):
+    # 读入数据
+    data = pd.read_excel('data.xlsx')
+    # 以闭市价作为股价构成标签
+    if type == 'train' or type == 'val':
+        price = data['value'].head(1000)
+    else:
+        price = data['value']
+        price.index = [x for x in range(len(price))]
+    # 归一化处理，便于后期加速模型收敛
+    Max = max(price)
+    price_norm = price / Max
+    # 时间序列时间步长为8，通过前8个数据预测第9个
+    X, y = etract_data(price_norm, time_step)
+    x_len = len(X)
+    X = X.cuda()
+    y = y.cuda()
+    # 构造迭代器，返回
+    if type == 'train':
+        X = X[:int(x_len * train_size_rate)]
+        y = y[:int(x_len * train_size_rate)]
+    elif type == 'val':
+        X = X[int(x_len * train_size_rate):]
+        y = y[int(x_len * train_size_rate):]
+    dataset = TensorDataset(X, y)
+    # 训练集数据随机打乱，验证集保持不变
+    if type == 'train':
+        shuffle = True
+    else:
+        shuffle = False
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
+    return dataloader,Max
+'''=====FOURTH PART==========================================================================='''
+#now we construct the main function
+#-------------------------
+if __name__ == '__main__':
+    #设置参数
+    learning_rate, epochs = 0.01, 20
+    train_size_rate = 0.8
+    time_step = 8
+    batch_size = 1
+    output_dim = 1
+    num_features = 1
+    hidden_size = 20
+    num_layers = 1
+    dropout = 0
+    non_linearity = 'tanh'
+    trainloader,train_Max = process_data('train',train_size_rate)
+    testloader,test_Max = process_data('val',train_size_rate)
+    predictloader,pred_Max = process_data('pred',train_size_rate)
+
+  
+    # Rnn初始隐藏单元hidden_prev初始化
+    hidden_prev = torch.ones(num_layers, batch_size, hidden_size).cuda()
+    # 设定超参数，训练模型
+    model = RNN(num_features=num_features, hidden_size=hidden_size,output_dim=output_dim,
+                 num_layers=num_layers, dropout=dropout, non_linearity=non_linearity)
+    model = model.cuda()
+    loss_function = nn.MSELoss().cuda()
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+
+    train_loss_step = torch.zeros(epochs)
+    test_loss_step = torch.zeros(epochs)
+    for epoch in range(epochs):
+        model.train()
+        for X, y in trainloader:
+            hidden_prev.detach_()
+            optimizer.zero_grad()
+            predict_y, hidden_prev = model(X, hidden_prev)
+            loss = loss_function(y, predict_y)
+            model.zero_grad()
+            loss.backward()
+            optimizer.step()
+            train_loss_step[epoch] = loss.item()
+            train_running_loss = loss.item()
+        print(f'Epoch {epoch}, Train Loss: {train_running_loss:.4f}')
+
+        model.eval()
+        with torch.no_grad():
+            for X, y in trainloader:
+                optimizer.zero_grad()
+                predict_y, hidden_prev = model(X, hidden_prev)
+                loss = loss_function(y, predict_y)
+                model.zero_grad()
+                test_loss_step[epoch] = loss.item()
+                test_running_loss = loss.item()
+                torch.save(model.state_dict(), "model.pth")
+            print(f'Epoch {epoch}, Test Loss: {test_running_loss:.4f}')
+        # 保留验证集损失最小的模型参数
+        print('*' * 50)
+
+    # 加载模型，绘图查看模型效果
+    model.load_state_dict(torch.load('model.pth'))
+    Val_y, Val_predict = [],[]
+    for X, y in predictloader:
+        with torch.no_grad():
+            predict_y, hidden_prev = model(X, hidden_prev)
+            y = y.cpu()
+            predict = predict_y.cpu()
+            Val_y.append(y[0][0]*pred_Max)
+            Val_predict.append((predict[0][0]*pred_Max).detach().numpy())
+
+    # 红色表示预测值，黑色表示实际值
+    fig0 = plt.figure(num = 0, figsize=(8, 5), dpi=120)
+    plt.plot(Val_y, color='black')
+    plt.plot(Val_predict, color='red')
+    plt.title('stock price')
+    plt.xlabel('time')
+    plt.ylabel('price')
+    plt.savefig('价格预测走势图')
+    plt.show()
+    #loss trend
+    fig1 = plt.figure(num=1, figsize=(8, 5), dpi=120)
+    plt.plot(train_loss_step, color='orange')
+    plt.plot(test_loss_step, color='red')
+    plt.title('loss trend')
+    plt.xlabel('epoch')
+    plt.ylabel('loss')
+    plt.savefig('loss trend')
+    plt.show()
+
+    #loss data xlsx
+    train_loss = train_loss_step.cpu().detach().numpy()
+    test_loss = test_loss_step.cpu().detach().numpy()
+    series1 = pd.Series(train_loss)
+    series2 = pd.Series(test_loss)
+    series3 = pd.Series(Val_predict)
+    dataframe1 = pd.concat([series1, series2], axis=1)
+    dataframe1.columns = ['train_loss', 'test_loss']
+    with open('train_describe.xlsx',mode = 'w') as file:
+        dataframe1.to_excel('train_describe.xlsx')
+        file.close()
+    with open('predict_data.xlsx',mode = 'w') as file:
+        series3.to_excel('predict_data.xlsx')
+        file.close()
+    print(type(train_loss))
